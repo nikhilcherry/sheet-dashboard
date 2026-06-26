@@ -6,6 +6,12 @@ data table. A **local LLM** reads your data and *designs* the dashboard, so it w
 **different / unique sheet every time**: nothing is hardcoded to one report, and nothing ever
 leaves your machine.
 
+![Sheet → Dashboard — Grid theme](assets/dashboard-grid.png)
+
+> The same data in the **Carbon** theme (one of four — Grid · Carbon · Indigo · Ember):
+>
+> ![Carbon theme](assets/dashboard-carbon.png)
+
 ```
 file ─▶ pandas extracts the real tables    (deterministic — numbers are never hallucinated)
      ─▶ build a compact PROFILE of every column (type, stats, top values, samples)
@@ -82,3 +88,7 @@ Generated dashboards are also saved under `generated/` and served at `/g/<name>.
   model the free-text **labels/insights can be loosely worded**; switch `MODEL` to `qwen2.5:14b`
   for tighter wording at ~2.5× the time.
 - KPI values count up on load — that's an animation; the final values are the real ones.
+
+## License
+
+[MIT](LICENSE) © nikhilcherry
