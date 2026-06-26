@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime output (dashboards are generated on the fly)
+generated/
+uploads/
+
+# Downloaded design skill (third-party, used only during development)
+.agents/
+skills-lock.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
