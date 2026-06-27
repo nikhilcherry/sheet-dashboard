@@ -26,6 +26,20 @@ show it), while **extraction and every number stay deterministic** so the dashbo
 correct. If the model is unreachable or returns junk, the spec is validated against the real
 columns and falls back to a deterministic plan, so it never fails to render.
 
+### Grounded insights & no nonsense aggregations
+
+The **Observations** are computed straight from the data — top-category concentration, outliers vs.
+the mean, completeness — so every number is correct. The model is only allowed to add digit-free
+qualitative colour; it can never emit a number. And identifier / year columns (`OrderID`, `Year`, …)
+are detected and shown as **distinct counts** instead of meaningless `Total OrderID` / `Average Year`
+sums.
+
+![Grounded insights — Grid theme](assets/update-grounded-grid.png)
+
+> The same board in the **Carbon** theme — note `Unique OrderID` / `Unique Year`, never a summed id:
+>
+> ![Grounded insights — Carbon theme](assets/update-grounded-carbon.png)
+
 ## Features
 
 - **Reads anything tabular** — Excel-as-HTML (even when headers are `<td>` cells), `.xlsx`/`.xls`

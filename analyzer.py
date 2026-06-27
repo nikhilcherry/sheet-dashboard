@@ -123,6 +123,40 @@ def col_kind(series: pd.Series):
     return "text"
 
 
+# Numeric columns that are NOT real measures: identifiers, codes, years.
+# Summing or averaging these ("Total EmployeeID", "Average Year") is nonsense —
+# only count / nunique / range mean anything.
+_ID_TOKENS = {"id", "ids", "code", "codes", "zip", "zipcode", "ssn", "uuid", "guid",
+              "account", "acct", "pin", "postal", "sku", "isbn", "phone", "mobile"}
+_YEAR_TOKENS = {"year", "yr", "fy"}
+
+
+def _name_tokens(name):
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(name))      # split camelCase
+    return set(re.split(r"[^a-zA-Z0-9]+", s.lower())) - {""}
+
+
+def is_measure(name, series):
+    """True only when sum/mean over this numeric column is meaningful. False for
+    identifiers (name says id/code/zip…, or near-unique integers) and year columns."""
+    nv = numeric_view(series).dropna()
+    if not len(nv):
+        return False
+    toks = _name_tokens(name)
+    if toks & _ID_TOKENS or toks & _YEAR_TOKENS:
+        return False
+    integral = bool((nv % 1 == 0).all())
+    if integral and nv.between(1900, 2100).mean() > 0.8:    # looks like a year column
+        return False
+    # Near-unique integers spanning a dense, consecutive range ⇒ auto-increment ID.
+    # (A genuine measure like salary is also distinct but spans a wide range, so it stays.)
+    if integral and len(series) >= 8 and \
+            series.nunique(dropna=True) / max(1, len(series)) > 0.9 and \
+            (nv.max() - nv.min()) <= len(nv) * 1.5:
+        return False
+    return True
+
+
 # --------------------------------------------------------------------------- #
 #  2. PROFILE the data so the model can reason cheaply
 # --------------------------------------------------------------------------- #
@@ -222,6 +256,105 @@ def ask_model(profile, valid_cols, focus="", nkpi=8, nchart=5):
 
 
 # --------------------------------------------------------------------------- #
+#  3b. ASK THE LOCAL MODEL for a few clarifying questions about THIS sheet
+# --------------------------------------------------------------------------- #
+QUESTION_INSTRUCTIONS = """You are a data analyst helping someone decide what their dashboard should
+emphasise. Given a JSON PROFILE of a spreadsheet, write %(n)d short clarifying questions whose answers
+would change what the dashboard highlights. Each question must be answerable in a few words and grounded
+in THIS data — reference the real column names / values from the profile. Respond with ONLY a JSON
+object, no prose:
+{"questions":[{"question":"...","options":["option 1","option 2","option 3"]}]}
+Give 2-4 concrete options per question, picked from real columns/values where it makes sense.
+Do NOT ask which metric or which column to group by (those are already handled). Output JSON only."""
+
+
+def ask_questions(profile, n=2):
+    """Local-model-written, data-grounded clarifying questions. Returns [] if the model is down or
+    produces junk — the deterministic questions in build_questions always carry the flow regardless."""
+    instr = QUESTION_INSTRUCTIONS % {"n": n}
+    prompt = instr + "\n\nPROFILE:\n" + json.dumps(profile)[:12000]
+    for model in [MODEL] + FALLBACK_MODELS:
+        try:
+            r = requests.post(OLLAMA_URL, json={
+                "model": model, "prompt": prompt, "stream": False,
+                "format": "json", "options": {"temperature": 0.3, "num_ctx": 8192},
+            }, timeout=180)
+            r.raise_for_status()
+            data = json.loads(r.json()["response"])
+            out = []
+            for q in (data.get("questions") or [])[:n]:
+                text = str(q.get("question", "")).strip()
+                if not text:
+                    continue
+                opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()][:4]
+                out.append({"question": text, "options": opts})
+            if out:
+                return out
+        except Exception as e:
+            print(f"[questions {model}] failed: {e}")
+            continue
+    return []
+
+
+def build_questions(tables, profile, focus=""):
+    """Deterministic, column-grounded questions (always reliable) + a couple of local-model questions.
+    Each question: {id, question, type:'single'|'text', options:[...], role}. role drives how the answer
+    is applied in analyze(): metric -> KPI priority, dimension -> chart, goal/freeform -> focus text."""
+    nums, cats = [], []
+    for _, df in tables:
+        for c in df.columns:
+            kind = col_kind(df[c])
+            if kind == "numeric" and str(c) not in nums:
+                nums.append(str(c))
+            elif kind == "categorical" and str(c) not in cats:
+                cats.append(str(c))
+    questions = []
+    if nums:
+        questions.append({"id": "metric", "role": "metric", "type": "single",
+                          "question": "Which number matters most to you?",
+                          "options": nums[:6] + ["No preference"]})
+    if cats:
+        questions.append({"id": "dimension", "role": "dimension", "type": "single",
+                          "question": "What should the data be broken down by?",
+                          "options": cats[:6] + ["No preference"]})
+    questions.append({"id": "goal", "role": "goal", "type": "single",
+                      "question": "What's the goal of this dashboard?",
+                      "options": ["Track totals & headline numbers", "Compare segments",
+                                  "Spot outliers & problems", "See the top performers"]})
+    for i, mq in enumerate(ask_questions(profile, n=2)):
+        questions.append({"id": f"ai{i}", "role": "freeform",
+                          "type": "single" if mq["options"] else "text",
+                          "question": mq["question"],
+                          "options": (mq["options"] + ["Other / not sure"]) if mq["options"] else []})
+    return questions
+
+
+_SKIP_ANSWERS = {"", "no preference", "other / not sure", "n/a", "none"}
+
+
+def answers_to_prefs(questions, answers):
+    """Fold the user's answers into dashboard preferences: a chosen metric column, a chosen grouping
+    dimension, a goal, and a human-readable focus string fed to the model. Unknown/blank answers skip."""
+    answers = answers or {}
+    metric = dim = goal = None
+    parts = []
+    for q in questions or []:
+        a = answers.get(q.get("id"))
+        if a is None or str(a).strip().lower() in _SKIP_ANSWERS:
+            continue
+        a = str(a).strip()
+        role = q.get("role")
+        if role == "metric":
+            metric = a
+        elif role == "dimension":
+            dim = a
+        elif role == "goal":
+            goal = a
+        parts.append(f'{q.get("question", "")} -> {a}')
+    return {"metric": metric, "dim": dim, "goal": goal, "focus": " | ".join(parts)}
+
+
+# --------------------------------------------------------------------------- #
 #  4. COMPUTE real chart data from the spec (deterministic)
 # --------------------------------------------------------------------------- #
 def _find_col(tables, name):
@@ -281,6 +414,9 @@ def compute_kpi(tables, kpi):
     # sum/mean/min/max are meaningless on a non-numeric column -> drop the KPI
     if not len(nv) or col_kind(df[col]) != "numeric":
         return None
+    # ...and summing/averaging an identifier or year column is nonsense too
+    if agg in ("sum", "mean") and not is_measure(col, df[col]):
+        return None
     val = {"sum": nv.sum, "mean": nv.mean, "min": nv.min,
            "max": nv.max}.get(agg, nv.sum)()
     return _fmt(float(val))
@@ -294,7 +430,7 @@ def compute_chart(tables, chart):
     limit = int(chart.get("limit") or 12)
     mdf, meas = _find_col(tables, chart.get("measure"))
     work = pd.DataFrame({"dim": df[dim].astype(str)})
-    if meas and mdf is df and agg in ("sum", "mean"):
+    if meas and mdf is df and agg in ("sum", "mean") and is_measure(meas, df[meas]):
         work["m"] = numeric_view(df[meas])
         g = work.dropna(subset=["m"]).groupby("dim")["m"]
         ser = (g.sum() if agg == "sum" else g.mean())
@@ -392,21 +528,24 @@ def auto_kpis(tables):
                  "agg": "count", "sub": label})
     for _, df in tables:
         for c in df.columns:
-            if col_kind(df[c]) == "numeric":
+            if col_kind(df[c]) == "numeric" and is_measure(c, df[c]):
                 pool.append({"label": f"Total {c}", "column": str(c), "agg": "sum"})
                 pool.append({"label": f"Average {c}", "column": str(c), "agg": "mean"})
                 pool.append({"label": f"Peak {c}", "column": str(c), "agg": "max"})
     for _, df in tables:
         for c in df.columns:
-            if col_kind(df[c]) == "categorical":
+            # categoricals + identifier/year numerics → a distinct-count headline
+            if col_kind(df[c]) == "categorical" or \
+                    (col_kind(df[c]) == "numeric" and not is_measure(c, df[c])):
                 pool.append({"label": f"Unique {c}", "column": str(c), "agg": "nunique"})
     return pool
 
 
-def build_kpis(tables, spec, target):
-    """Merge the model's KPIs (nice labels, first) with the deterministic pool, de-duped."""
+def build_kpis(tables, spec, target, lead=None):
+    """Merge the model's KPIs (nice labels, first) with the deterministic pool, de-duped.
+    `lead` KPIs (e.g. the user's chosen metric) are tried first so they head the board."""
     seen, out = set(), []
-    for k in list(spec.get("kpis", [])) + auto_kpis(tables):
+    for k in list(lead or []) + list(spec.get("kpis", [])) + auto_kpis(tables):
         key = (str(k.get("column", "")).lower(), (k.get("agg") or "sum").lower())
         if key in seen:
             continue
@@ -422,26 +561,106 @@ def build_kpis(tables, spec, target):
 
 
 # --------------------------------------------------------------------------- #
+#  6b. GROUNDED insights — every number comes from the computed data, never the LLM
+# --------------------------------------------------------------------------- #
+def derive_insights(tables, charts):
+    """Build observations straight from the computed charts/columns so the numbers are
+    always correct. The model is only allowed to add digit-free qualitative color later."""
+    out = []
+    # Concentration: read the leading chart's distribution.
+    for ch in charts:
+        vals, labels = ch.get("values") or [], ch.get("labels") or []
+        tot = sum(vals)
+        if len(vals) >= 2 and tot > 0:
+            meas = ch.get("measure") if ch.get("agg") in ("sum", "mean") else None
+            tail = f"of total {meas}" if meas else "of all records"
+            out.append(f"‘{labels[0]}’ leads {ch.get('dimension')} at "
+                       f"{_fmt(vals[0])} ({vals[0] / tot * 100:.0f}% {tail}).")
+            if len(vals) >= 3:
+                s3 = sum(vals[:3]) / tot * 100
+                if s3 >= 60:
+                    out.append(f"The top 3 {ch.get('dimension')} values make up "
+                               f"{s3:.0f}% of the total — a concentrated distribution.")
+            break
+    # Spread / outliers on real measures.
+    seen = set()
+    for _, df in tables:
+        for c in df.columns:
+            key = str(c).lower()
+            if key in seen or col_kind(df[c]) != "numeric" or not is_measure(c, df[c]):
+                continue
+            nv = numeric_view(df[c]).dropna()
+            if len(nv) < 3:
+                continue
+            mean, mx, mn, sd = nv.mean(), nv.max(), nv.min(), nv.std()
+            if sd and (mx - mean) / sd >= 2:
+                out.append(f"{c} has a standout high of {_fmt(float(mx))}, far above the "
+                           f"average of {_fmt(float(mean))}.")
+            else:
+                out.append(f"{c} ranges {_fmt(float(mn))}–{_fmt(float(mx))} "
+                           f"(average {_fmt(float(mean))}).")
+            seen.add(key)
+            if len(seen) >= 2:
+                break
+        if len(seen) >= 2:
+            break
+    # Data completeness — surfaces the nulls we already profile but never showed.
+    total = sum(int(df.size) for _, df in tables)
+    nulls = sum(int(df.isna().sum().sum()) for _, df in tables)
+    if total and nulls:
+        complete = (1 - nulls / total) * 100
+        if complete < 99.5:
+            out.append(f"The sheet is {complete:.0f}% complete "
+                       f"({nulls:,} empty cells across {total:,}).")
+    return out
+
+
+# --------------------------------------------------------------------------- #
 #  7. ORCHESTRATE
 # --------------------------------------------------------------------------- #
-def analyze(raw_bytes, filename, focus="", detail="standard", theme="grid"):
+def _lead_kpis(tables, metric):
+    """KPI specs for the user's chosen metric so it heads the board."""
+    if not metric:
+        return []
+    df, col = _find_col(tables, metric)
+    if df is None or col is None:
+        return []
+    if col_kind(df[col]) == "numeric" and is_measure(col, df[col]):
+        return [{"label": f"Total {col}", "column": col, "agg": "sum"},
+                {"label": f"Average {col}", "column": col, "agg": "mean"},
+                {"label": f"Peak {col}", "column": col, "agg": "max"}]
+    return [{"label": f"Unique {col}", "column": col, "agg": "nunique"}]
+
+
+def _relevant(chart, metric, dim, tables):
+    """Does this computed chart touch the user's chosen metric or dimension?"""
+    _, mcol = _find_col(tables, metric) if metric else (None, None)
+    _, dcol = _find_col(tables, dim) if dim else (None, None)
+    return (dcol and chart.get("dimension") == dcol) or (mcol and chart.get("measure") == mcol)
+
+
+def analyze(raw_bytes, filename, focus="", detail="standard", theme="grid",
+            primary_metric=None, primary_dim=None, goal="", extra_focus="", scope="full"):
     tables = load_tables(raw_bytes, filename)
     if not tables:
         raise ValueError("No tabular data could be extracted from this file.")
     detailed = (detail == "detailed")
-    nkpi_target = 16 if detailed else 9
-    nchart_target = 7 if detailed else 5
+    focused = (scope == "focused")
+    nkpi_target = 6 if focused else (16 if detailed else 9)
+    nchart_target = 3 if focused else (7 if detailed else 5)
+
+    full_focus = " | ".join(p for p in (focus.strip(), (extra_focus or "").strip()) if p)
 
     profile = build_profile(tables)
     valid_cols = [str(c) for _, df in tables for c in df.columns]
-    spec = ask_model(profile, valid_cols, focus=focus,
+    spec = ask_model(profile, valid_cols, focus=full_focus,
                      nkpi=nkpi_target, nchart=nchart_target) \
         or fallback_spec(tables, profile)
 
-    kpis = build_kpis(tables, spec, nkpi_target)
+    kpis = build_kpis(tables, spec, nkpi_target, lead=_lead_kpis(tables, primary_metric))
 
     charts = []
-    for ch in spec.get("charts", [])[:nchart_target]:
+    for ch in spec.get("charts", [])[:nchart_target + 2]:
         c = compute_chart(tables, ch)
         if c:
             charts.append(c)
@@ -449,7 +668,32 @@ def analyze(raw_bytes, filename, focus="", detail="standard", theme="grid"):
         charts = [c for c in (compute_chart(tables, ch)
                   for ch in fallback_spec(tables, profile)["charts"]) if c]
 
+    # Guarantee a chart on the user's chosen dimension (measured by their metric if given).
+    if primary_dim:
+        ddf, dcol = _find_col(tables, primary_dim)
+        if dcol and not any(c.get("dimension") == dcol for c in charts):
+            _, mcol = _find_col(tables, primary_metric) if primary_metric else (None, None)
+            lead_chart = compute_chart(tables, {
+                "title": f"{dcol} breakdown", "type": "bar", "dimension": dcol,
+                "measure": mcol, "agg": "sum" if mcol else "count", "limit": 12})
+            if lead_chart:
+                charts.insert(0, lead_chart)
+
+    # Order so answer-relevant charts come first; in focused mode keep only those (then trim).
+    if primary_metric or primary_dim:
+        charts.sort(key=lambda c: 0 if _relevant(c, primary_metric, primary_dim, tables) else 1)
+        if focused:
+            rel = [c for c in charts if _relevant(c, primary_metric, primary_dim, tables)]
+            charts = rel or charts
+    charts = charts[:nchart_target]
+
     stats = compute_stats(tables)
+
+    # Insights: computed numbers come first (always correct); keep only the model's
+    # digit-free qualitative observations — it is never trusted to emit a number.
+    grounded = derive_insights(tables, charts)
+    model_color = [s for s in spec.get("insights", []) if not re.search(r"\d", str(s))]
+    insights = (grounded + model_color)[:6] or spec.get("insights", [])[:6]
 
     label, big = max(tables, key=lambda t: t[1].size)
     preview = {
@@ -465,15 +709,17 @@ def analyze(raw_bytes, filename, focus="", detail="standard", theme="grid"):
         "subtitle": spec.get("subtitle", ""),
         "kpis": kpis,
         "charts": charts,
-        "insights": spec.get("insights", [])[:6],
+        "insights": insights,
         "stats": stats,
         "preview": preview,
         "meta": {
             "model": spec.get("_model", MODEL),
             "tables": len(tables),
             "theme": theme,
-            "focus": focus.strip(),
+            "focus": full_focus,
             "detail": detail,
+            "scope": scope,
+            "goal": goal or "",
             "source": filename or "data",
         },
     }
