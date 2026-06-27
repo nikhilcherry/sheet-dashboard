@@ -8,7 +8,7 @@ import traceback
 from flask import Flask, request, send_file, abort
 
 from analyzer import (analyze, load_tables, build_profile, build_questions,
-                      answers_to_prefs)
+                      answers_to_prefs, interpret_widget)
 from render import render_dashboard
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +32,20 @@ def _remember(raw, filename, focus, questions):
             SESSIONS.pop(old, None)
     SESSIONS[sid] = {"raw": raw, "filename": filename, "focus": focus, "questions": questions}
     return sid
+
+
+# Per-rendered-dashboard store, keyed by the generated file name, so the live
+# "Add your own" box can recompute new KPIs/charts from the original data, append
+# them to the result, and re-render the file (the Download re-fetches that file).
+DASHBOARDS = {}
+DASHBOARD_CAP = 24
+
+
+def _store_dashboard(name, raw, filename, data):
+    if len(DASHBOARDS) >= DASHBOARD_CAP:                    # evict oldest
+        for old in list(DASHBOARDS)[: len(DASHBOARDS) - DASHBOARD_CAP + 1]:
+            DASHBOARDS.pop(old, None)
+    DASHBOARDS[name] = {"raw": raw, "filename": filename, "data": data}
 
 UPLOAD_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -340,9 +354,50 @@ def generate():
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
     SESSIONS.pop(sid, None)
+    _store_dashboard(name, raw, filename, data)
     print(f"[ok] {filename} -> {out}  (scope={scope}, {len(data['charts'])} charts, "
           f"{len(data['kpis'])} kpis, model={data['meta']['model']})")
     return {"url": f"/g/{name}"}, 200
+
+
+@app.route("/add_widget", methods=["POST"])
+def add_widget():
+    """Live extension: turn a plain-English request from the dashboard's 'Add your own' box into one
+    computed KPI/chart, append it, and re-render+persist the file so a later Download includes it."""
+    name = os.path.basename(request.form.get("id", ""))
+    req_text = (request.form.get("request") or "").strip()
+    if not req_text:
+        return {"error": "Type what you'd like to add."}, 400
+    entry = DASHBOARDS.get(name)
+    if not entry:
+        return {"error": "This dashboard's session has expired — regenerate it to add widgets."}, 410
+    try:
+        tables = load_tables(entry["raw"], entry["filename"])
+        profile = build_profile(tables)
+        widget = interpret_widget(req_text, tables, profile)
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": f"Could not process that: {e}"}, 400
+    if not widget:
+        return {"error": "Couldn't turn that into a metric or chart — try naming a column, "
+                         "e.g. \"average revenue by region\"."}, 422
+
+    data = entry["data"]
+    if widget["kind"] == "kpi":
+        data["kpis"].append(widget["kpi"])
+        payload = {"kind": "kpi", "kpi": widget["kpi"]}
+    else:
+        data["charts"].append(widget["chart"])
+        payload = {"kind": "chart", "chart": widget["chart"]}
+    try:
+        html = render_dashboard(data)
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": f"Could not re-render dashboard: {e}"}, 400
+    with open(os.path.join(GEN, name), "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"[add_widget] {name} += {widget['kind']} :: {req_text!r}")
+    return payload, 200
 
 
 if __name__ == "__main__":

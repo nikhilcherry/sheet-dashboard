@@ -283,6 +283,22 @@ table.data td.rn{font-family:'IBM Plex Mono',monospace;color:var(--muted);text-a
 table.data tbody tr:hover td{background:var(--panel2)}
 table.data tbody tr:hover td.rn{background:var(--line)}
 
+/* ── live "add your own" box (never exported) ─────────── */
+.eb .col.plus{background:var(--panel2);color:var(--accent);border:1px solid var(--line);font-size:1rem}
+.adder{display:flex;gap:10px;flex-wrap:wrap}
+.addq{flex:1;min-width:260px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;
+     background:var(--panel);color:var(--ink);font-family:'IBM Plex Mono',monospace;font-size:.85rem}
+.addq:focus{outline:none;border-color:var(--accent)}
+.addBtn{padding:12px 22px;border:1px solid var(--accent);border-radius:9px;cursor:pointer;
+     background:var(--accent);color:var(--accent-ink);font-family:'IBM Plex Mono',monospace;
+     font-size:.84rem;font-weight:600;transition:filter .15s,transform .12s}
+.addBtn:hover{filter:brightness(1.07);transform:translateY(-1px)}
+.addBtn:disabled{opacity:.55;cursor:default;transform:none}
+.addmsg{margin-top:12px;font-family:'IBM Plex Mono',monospace;font-size:.76rem;color:var(--muted);
+     min-height:18px;line-height:1.5}
+.addmsg.err{color:#e0564a}
+.flash{animation:flash 1.1s ease-out}
+@keyframes flash{0%{box-shadow:0 0 0 2px var(--accent)}100%{box-shadow:0 0 0 0 transparent}}
 footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--line);
      font-family:'IBM Plex Mono',monospace;color:var(--muted);font-size:.74rem;
      display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
@@ -303,9 +319,9 @@ footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--line);
   <p class="sub">__SUBTITLE__</p>
   <div class="formula"><span class="fx">fx</span><code>__FORMULA__</code></div>
 
-  <section class="section">__EB_A__<div class="kpis">__KPIS__</div></section>
+  <section class="section">__EB_A__<div class="kpis" id="kpiGrid">__KPIS__</div></section>
   <section class="section">__EB_B__<div class="notes"><ul>__INSIGHTS__</ul></div></section>
-  <section class="section">__EB_C__<div class="grid2">__CHARTS__</div></section>
+  <section class="section">__EB_C__<div class="grid2" id="chartGrid">__CHARTS__</div></section>
   <section class="section">__EB_D__<div class="grid2">__STATS__</div></section>
   <section class="section">__EB_E__
     <div class="preview">
@@ -314,6 +330,17 @@ footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--line);
       <div class="dscroll"><table class="data" id="dt">
         <thead><tr><th class="rn">#</th>__THEAD__</tr></thead><tbody>__TBODY__</tbody></table></div>
     </div>
+  </section>
+
+  <!-- live "add your own" box — stripped from the downloaded file (.no-export) -->
+  <section class="section no-export" id="adder">
+    <div class="eb"><span class="col plus">+</span><span class="eb-l">Add your own</span></div>
+    <div class="adder">
+      <input id="addq" class="addq" autocomplete="off"
+        placeholder='What other KPI or chart do you want? — e.g. “average revenue by region as a pie”'/>
+      <button id="addBtn" class="addBtn" type="button">Add →</button>
+    </div>
+    <div class="addmsg" id="addmsg">Type a metric or chart in plain English — it's computed from your real data and added above. This box isn't included when you download.</div>
   </section>
 
   <footer><span>Built locally — no data left this machine.</span><span>model · __MODEL__</span></footer>
@@ -326,11 +353,10 @@ Chart.defaults.color=TICK;
 Chart.defaults.font.family="'IBM Plex Mono',monospace";
 Chart.defaults.font.size=11;
 
-CHARTS.forEach((c,i)=>{
-  const el=document.getElementById("chart"+i); if(!el) return;
+function buildChart(el,c,i){
   const circ=c.type==="pie"||c.type==="doughnut";
   const cols=c.labels.map((_,j)=>PALETTE[j%PALETTE.length]);
-  new Chart(el,{type:c.type,data:{labels:c.labels,datasets:[{label:c.title,data:c.values,
+  return new Chart(el,{type:c.type,data:{labels:c.labels,datasets:[{label:c.title,data:c.values,
       backgroundColor:circ?cols:(c.type==="line"?PALETTE[i%PALETTE.length]+"22":cols),
       borderColor:circ?SEG:(c.type==="line"?PALETTE[i%PALETTE.length]:cols),
       borderWidth:circ?2:(c.type==="line"?2.5:0),borderRadius:c.type==="bar"?3:0,
@@ -347,7 +373,8 @@ CHARTS.forEach((c,i)=>{
           ticks:{maxRotation:40,autoSkip:true,
             callback(v){const s=this.getLabelForValue(v);return s.length>13?s.slice(0,12)+"…":s;}}},
         y:{grid:{color:GRID},border:{display:false},beginAtZero:true}}}});
-});
+}
+CHARTS.forEach((c,i)=>{const el=document.getElementById("chart"+i);if(el)buildChart(el,c,i);});
 
 document.querySelectorAll(".kpi-val").forEach(el=>{
   const raw=el.dataset.val, num=parseFloat(raw.replace(/[^0-9.\-]/g,""));
@@ -362,8 +389,13 @@ document.querySelectorAll(".kpi-val").forEach(el=>{
 
 const dl=document.getElementById("dlBtn");
 dl&&dl.addEventListener("click",async()=>{
-  let html; try{html=await(await fetch(location.href)).text();}
-  catch(e){html="<!DOCTYPE html>\n"+document.documentElement.outerHTML;}
+  // Download the persisted dashboard, but strip the interactive "add your own" box
+  // (.no-export) so the typing UI never ships in the saved file — added widgets stay.
+  let el;
+  try{el=new DOMParser().parseFromString(await(await fetch(location.href)).text(),"text/html").documentElement;}
+  catch(e){el=document.documentElement.cloneNode(true);}
+  el.querySelectorAll(".no-export").forEach(n=>n.remove());
+  const html="<!DOCTYPE html>\n"+el.outerHTML;
   const a=document.createElement("a");
   a.href=URL.createObjectURL(new Blob([html],{type:"text/html"}));
   a.download=(document.title||"dashboard").replace(/[^\w]+/g,"_")+".html";
@@ -375,6 +407,47 @@ const q=document.getElementById("q");
 q&&q.addEventListener("input",e=>{const s=e.target.value.toLowerCase();
   document.querySelectorAll("#dt tbody tr").forEach(tr=>{
     tr.style.display=tr.textContent.toLowerCase().includes(s)?"":"none";});});
+
+/* ── live "add your own" KPI / chart ──────────────────── */
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
+  .replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+let kpiN=document.querySelectorAll("#kpiGrid .kpi").length;
+let chartN=CHARTS.length;
+function addKpi(k){
+  const d=document.createElement("div");d.className="kpi flash";
+  d.style.setProperty("--k",PALETTE[kpiN%PALETTE.length]);
+  d.innerHTML='<div class="kpi-val">'+esc(k.value)+'</div><div class="kpi-lbl">'+esc(k.label)+'</div>'
+    +(k.sub?'<div class="kpi-sub">'+esc(k.sub)+'</div>':'');
+  document.getElementById("kpiGrid").appendChild(d);kpiN++;
+  d.scrollIntoView({behavior:"smooth",block:"center"});
+}
+function addChart(c){
+  const i=chartN++;const fig=document.createElement("figure");fig.className="chart flash";
+  fig.innerHTML='<figcaption>'+esc(c.title)+'</figcaption><div class="cwrap"><canvas id="chart'+i+'"></canvas></div>';
+  document.getElementById("chartGrid").appendChild(fig);
+  buildChart(fig.querySelector("canvas"),c,i);
+  fig.scrollIntoView({behavior:"smooth",block:"center"});
+}
+const addBtn=document.getElementById("addBtn"),addq=document.getElementById("addq"),
+      addmsg=document.getElementById("addmsg");
+async function submitAdd(){
+  const text=(addq.value||"").trim();
+  if(!text){addmsg.className="addmsg err";addmsg.textContent="Type what you'd like to add.";return;}
+  addBtn.disabled=true;addmsg.className="addmsg";addmsg.textContent="Building from your data…";
+  try{
+    const id=location.pathname.split("/").filter(Boolean).pop();
+    const fd=new FormData();fd.append("id",id);fd.append("request",text);
+    const r=await fetch("/add_widget",{method:"POST",body:fd});
+    const w=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(w.error||("HTTP "+r.status));
+    if(w.kind==="kpi"){addKpi(w.kpi);addmsg.textContent='✓ Added KPI “'+w.kpi.label+'”. Ask for another?';}
+    else{addChart(w.chart);addmsg.textContent='✓ Added chart “'+w.chart.title+'”. Ask for another?';}
+    addq.value="";
+  }catch(e){addmsg.className="addmsg err";addmsg.textContent="⚠ "+e.message;}
+  addBtn.disabled=false;
+}
+addBtn&&addBtn.addEventListener("click",submitAdd);
+addq&&addq.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();submitAdd();}});
 </script>
 </body>
 </html>"""

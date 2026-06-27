@@ -415,10 +415,10 @@ def compute_kpi(tables, kpi):
     if not len(nv) or col_kind(df[col]) != "numeric":
         return None
     # ...and summing/averaging an identifier or year column is nonsense too
-    if agg in ("sum", "mean") and not is_measure(col, df[col]):
+    if agg in ("sum", "mean", "median") and not is_measure(col, df[col]):
         return None
-    val = {"sum": nv.sum, "mean": nv.mean, "min": nv.min,
-           "max": nv.max}.get(agg, nv.sum)()
+    val = {"sum": nv.sum, "mean": nv.mean, "median": nv.median,
+           "min": nv.min, "max": nv.max}.get(agg, nv.sum)()
     return _fmt(float(val))
 
 
@@ -723,3 +723,133 @@ def analyze(raw_bytes, filename, focus="", detail="standard", theme="grid",
             "source": filename or "data",
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+#  8. INTERPRET a free-text "add a KPI / chart" request into ONE computed widget
+#     (used by the live "Add your own" box at the bottom of a rendered dashboard)
+# --------------------------------------------------------------------------- #
+WIDGET_INSTRUCTIONS = """You convert a user's plain-English request into ONE dashboard widget for a
+specific spreadsheet. You are given the column PROFILE and the user's REQUEST. Respond with ONLY a
+JSON object, no prose, in ONE of these two shapes:
+
+KPI (a single headline number):
+{"kind":"kpi","label":"short label","column":"<exact column name>","agg":"sum|mean|min|max|count|nunique"}
+
+CHART:
+{"kind":"chart","title":"short title","type":"bar|line|pie|doughnut","dimension":"<categorical column>",
+ "measure":"<numeric column, or null to count rows>","agg":"sum|mean|count","limit":12}
+
+Use EXACT column names from the profile. sum/mean/min/max need a numeric column; count = number of
+rows, nunique = distinct values. If the user asks to see something "by" a category, or asks for a
+chart / graph / breakdown / trend, return a chart; otherwise return a KPI. Output JSON only."""
+
+
+def _ask_widget_model(request_text, profile):
+    prompt = (WIDGET_INSTRUCTIONS + f'\n\nREQUEST: "{request_text.strip()}"\n\nPROFILE:\n'
+              + json.dumps(profile)[:9000])
+    for model in [MODEL] + FALLBACK_MODELS:
+        try:
+            r = requests.post(OLLAMA_URL, json={
+                "model": model, "prompt": prompt, "stream": False,
+                "format": "json", "options": {"temperature": 0.1, "num_ctx": 8192},
+            }, timeout=120)
+            r.raise_for_status()
+            spec = json.loads(r.json()["response"])
+            if isinstance(spec, dict) and spec.get("kind") in ("kpi", "chart"):
+                return spec
+        except Exception as e:
+            print(f"[widget {model}] failed: {e}")
+            continue
+    return None
+
+
+_AGG_WORDS = [
+    (("median",), "median"),
+    (("average", "avg", "mean"), "mean"),
+    (("distinct", "unique", "how many different"), "nunique"),
+    (("count", "number of", "how many", "records", "rows"), "count"),
+    (("maximum", "max ", "peak", "highest", "largest", "biggest", "top"), "max"),
+    (("minimum", "min ", "lowest", "smallest"), "min"),
+    (("total", "sum"), "sum"),
+]
+_CHART_WORDS = ("chart", "graph", "plot", "pie", "bar", "line", "trend", "breakdown",
+                "distribution", "histogram", " by ", "over time", "per ")
+
+
+def _col_kind_of(name, tables):
+    for _, df in tables:
+        for c in df.columns:
+            if str(c) == name:
+                return col_kind(df[c])
+    return "text"
+
+
+def _parse_widget(request_text, tables):
+    """Deterministic fallback when the model is down: scan the request for column names and an
+    aggregation keyword, and decide KPI vs chart. Always grounded in real columns."""
+    text = " " + request_text.lower().strip() + " "
+    names = sorted({str(c) for _, df in tables for c in df.columns}, key=len, reverse=True)
+    mentioned = [c for c in names if c.lower() in text]
+    agg = next((a for words, a in _AGG_WORDS if any(w in text for w in words)), "sum")
+    nums = [c for c in mentioned if _col_kind_of(c, tables) == "numeric"]
+    cats = [c for c in mentioned if _col_kind_of(c, tables) == "categorical"]
+    wants_chart = any(w in text for w in _CHART_WORDS)
+
+    if wants_chart:
+        dim = cats[0] if cats else None
+        if not dim:                                   # fall back to any categorical column
+            for _, df in tables:
+                for c in df.columns:
+                    if col_kind(df[c]) == "categorical":
+                        dim = str(c)
+                        break
+                if dim:
+                    break
+        if not dim:
+            return None
+        meas = nums[0] if nums else None
+        ctype = ("pie" if "pie" in text else
+                 "doughnut" if ("doughnut" in text or "donut" in text) else
+                 "line" if ("line" in text or "trend" in text or "over time" in text) else "bar")
+        cagg = "mean" if agg == "mean" else ("sum" if meas else "count")
+        return {"kind": "chart", "title": request_text.strip()[:60], "type": ctype,
+                "dimension": dim, "measure": meas, "agg": cagg, "limit": 12}
+
+    if nums:
+        col = nums[0]
+    elif mentioned:
+        col = mentioned[0]
+        if agg in ("sum", "mean", "min", "max"):       # non-numeric → distinct count
+            agg = "nunique"
+    else:
+        return None
+    return {"kind": "kpi", "label": request_text.strip()[:40], "column": col, "agg": agg}
+
+
+def interpret_widget(request_text, tables, profile):
+    """Turn a free-text request into ONE computed widget. Model first, deterministic parse as
+    fallback. Returns {"kind":"kpi","kpi":{label,value,sub}} or {"kind":"chart","chart":{...}},
+    or None if it can't be grounded in the real columns."""
+    spec = _ask_widget_model(request_text, profile) or _parse_widget(request_text, tables)
+    if not isinstance(spec, dict):
+        return None
+
+    if spec.get("kind") == "chart":
+        c = compute_chart(tables, spec)
+        if not c:                                      # model picked a bad column → try parser
+            spec = _parse_widget(request_text, tables)
+            c = compute_chart(tables, spec) if spec and spec.get("kind") == "chart" else None
+        if not c:
+            return None
+        if spec.get("title"):
+            c["title"] = spec["title"]
+        return {"kind": "chart", "chart": c}
+
+    val = compute_kpi(tables, spec)
+    if val is None:                                    # e.g. asked to sum an identifier → blocked
+        return None
+    _, col = _find_col(tables, spec.get("column"))
+    agg = (spec.get("agg") or "sum").lower()
+    label = spec.get("label") or (f"{_AGG_SUB.get(agg, '').title()} {col}".strip() if col else "Metric")
+    return {"kind": "kpi", "kpi": {"label": label, "value": val, "sub": _agg_sub(spec)}}
