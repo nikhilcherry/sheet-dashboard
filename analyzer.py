@@ -19,6 +19,11 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.2:3b"          # fast & fully local; falls back to bigger models on junk output
 FALLBACK_MODELS = ["qwen2.5:14b", "qwen2.5-coder:14b", "qwen2.5:1.5b"]
 
+# The "Add your own" box turns one free-text request into one widget. It's a single interactive
+# call where a smart interpretation matters far more than latency, so it LEADS with the strongest
+# local model and only drops to the fast one if the big model is unavailable/too slow.
+WIDGET_MODELS = ["qwen2.5:14b", "qwen2.5-coder:14b", "llama3.2:3b", "qwen2.5:1.5b"]
+
 PALETTE = ["#6366f1", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6",
            "#ec4899", "#14b8a6", "#f97316", "#3b82f6", "#84cc16", "#a855f7"]
 
@@ -148,12 +153,14 @@ def is_measure(name, series):
     integral = bool((nv % 1 == 0).all())
     if integral and nv.between(1900, 2100).mean() > 0.8:    # looks like a year column
         return False
-    # Near-unique integers spanning a dense, consecutive range ⇒ auto-increment ID.
-    # (A genuine measure like salary is also distinct but spans a wide range, so it stays.)
-    if integral and len(series) >= 8 and \
-            series.nunique(dropna=True) / max(1, len(series)) > 0.9 and \
-            (nv.max() - nv.min()) <= len(nv) * 1.5:
-        return False
+    # Auto-increment IDs are near-unique integers that form a (near-)CONTIGUOUS run — i.e. the
+    # distinct values nearly fill their own min..max span (1001,1002,…). A real measure like a
+    # weight or salary is also distinct but sparse within its range, so it stays a measure.
+    nun = series.nunique(dropna=True)
+    if integral and len(series) >= 8 and nun / max(1, len(series)) > 0.9:
+        span = float(nv.max() - nv.min()) + 1
+        if span > 0 and nun / span > 0.9:
+            return False
     return True
 
 
@@ -430,24 +437,35 @@ def compute_chart(tables, chart):
     limit = int(chart.get("limit") or 12)
     mdf, meas = _find_col(tables, chart.get("measure"))
     work = pd.DataFrame({"dim": df[dim].astype(str)})
-    if meas and mdf is df and agg in ("sum", "mean") and is_measure(meas, df[meas]):
+    if meas and mdf is df and agg in ("sum", "mean", "max", "min") and is_measure(meas, df[meas]):
         work["m"] = numeric_view(df[meas])
         g = work.dropna(subset=["m"]).groupby("dim")["m"]
-        ser = (g.sum() if agg == "sum" else g.mean())
+        grouped = {"sum": g.sum, "mean": g.mean, "max": g.max, "min": g.min}[agg]()
     else:
-        ser = work.groupby("dim").size()
+        grouped = work.groupby("dim").size()
         agg = "count"
-    ser = ser.sort_values(ascending=False).head(limit)
-    if not len(ser):
+    if not len(grouped):
         return None
-    return {
-        "title": chart.get("title") or f"{dim}",
-        "type": chart.get("type", "bar") if chart.get("type") in
-                ("bar", "line", "pie", "doughnut") else "bar",
-        "labels": [str(x) for x in ser.index.tolist()],
-        "values": [round(float(x), 3) for x in ser.values.tolist()],
-        "dimension": dim, "measure": meas, "agg": agg,
-    }
+
+    def slice_of(ser):
+        return {"labels": [str(x) for x in ser.index.tolist()],
+                "values": [round(float(x), 3) for x in ser.values.tolist()]}
+
+    # "min"/"lightest" defaults to smallest-first; everything else ranks largest-first.
+    default = grouped.sort_values(ascending=(agg == "min")).head(limit)
+    if not len(default):
+        return None
+    ctype = chart.get("type", "bar") if chart.get("type") in \
+        ("bar", "line", "pie", "doughnut") else "bar"
+    out = {"title": chart.get("title") or f"{dim}", "type": ctype,
+           **slice_of(default), "dimension": dim, "measure": meas, "agg": agg}
+    # bar/line charts carry both ends so the page can toggle Top ⇄ Bottom client-side.
+    if ctype in ("bar", "line"):
+        ranked = grouped.sort_values(ascending=False)
+        out["top"] = slice_of(ranked.head(limit))
+        out["bottom"] = slice_of(ranked.tail(limit).iloc[::-1])
+        out["rankable"] = bool(len(ranked) > limit)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -742,22 +760,46 @@ CHART:
 
 Use EXACT column names from the profile. sum/mean/min/max need a numeric column; count = number of
 rows, nunique = distinct values. If the user asks to see something "by" a category, or asks for a
-chart / graph / breakdown / trend, return a chart; otherwise return a KPI. Output JSON only."""
+chart / graph / breakdown / trend, return a chart; otherwise return a KPI.
+
+SUPERLATIVES & RANKINGS — important: a request like "heaviest player", "top earners", "oldest
+customers", "highest-scoring teams" means the user wants to compare entities BY a numeric column.
+Return a CHART with dimension = the entity column (e.g. the name) and measure = the relevant numeric
+column (it is sorted automatically) — OR a KPI with max/min on that numeric column. NEVER count how
+often each name appears. Only leave "measure" null when the user explicitly asks for frequencies or
+counts. Always set "measure" to a numeric column when the request implies a quantity. Output JSON only."""
 
 
-def _ask_widget_model(request_text, profile):
+def _widget_spec_ok(spec, tables):
+    """Accept a model's widget spec only if it's well-formed AND points at a column that really
+    exists — otherwise a confident-but-wrong answer (bad column / hallucinated field) gets accepted
+    and silently computes to nothing. Rejecting it lets the next model (or the parser) try."""
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("kind") == "chart":
+        df, _ = _find_col(tables, spec.get("dimension"))
+        return df is not None
+    if spec.get("kind") == "kpi":
+        df, _ = _find_col(tables, spec.get("column"))
+        return df is not None
+    return False
+
+
+def _ask_widget_model(request_text, profile, tables):
     prompt = (WIDGET_INSTRUCTIONS + f'\n\nREQUEST: "{request_text.strip()}"\n\nPROFILE:\n'
               + json.dumps(profile)[:9000])
-    for model in [MODEL] + FALLBACK_MODELS:
+    for model in WIDGET_MODELS:
         try:
             r = requests.post(OLLAMA_URL, json={
                 "model": model, "prompt": prompt, "stream": False,
                 "format": "json", "options": {"temperature": 0.1, "num_ctx": 8192},
-            }, timeout=120)
+            }, timeout=200)
             r.raise_for_status()
             spec = json.loads(r.json()["response"])
-            if isinstance(spec, dict) and spec.get("kind") in ("kpi", "chart"):
+            if _widget_spec_ok(spec, tables):
+                print(f"[widget {model}] ok: {spec.get('kind')} :: {request_text!r}")
                 return spec
+            print(f"[widget {model}] spec referenced no real column; trying next")
         except Exception as e:
             print(f"[widget {model}] failed: {e}")
             continue
@@ -775,6 +817,10 @@ _AGG_WORDS = [
 ]
 _CHART_WORDS = ("chart", "graph", "plot", "pie", "bar", "line", "trend", "breakdown",
                 "distribution", "histogram", " by ", "over time", "per ")
+_SUPERLATIVE_MAX = ("heaviest", "tallest", "oldest", "largest", "biggest", "highest", "longest",
+                    "most", "top", "richest", "strongest", "fastest", "greatest", "maximum")
+_SUPERLATIVE_MIN = ("lightest", "shortest", "youngest", "smallest", "lowest", "least", "cheapest",
+                    "slowest", "weakest", "minimum")
 
 
 def _col_kind_of(name, tables):
@@ -795,6 +841,17 @@ def _parse_widget(request_text, tables):
     nums = [c for c in mentioned if _col_kind_of(c, tables) == "numeric"]
     cats = [c for c in mentioned if _col_kind_of(c, tables) == "categorical"]
     wants_chart = any(w in text for w in _CHART_WORDS)
+    sup_max = any(w in text for w in _SUPERLATIVE_MAX)
+    sup_min = any(w in text for w in _SUPERLATIVE_MIN)
+
+    # "heaviest player", "youngest customer" with no explicit chart → the extreme value of the
+    # relevant measure (a single clear number), never a count of how often a name appears.
+    if (sup_max or sup_min) and not wants_chart:
+        big = max((df for _, df in tables), key=lambda d: len(d))
+        meas = nums[0] if nums else _pick_measure(request_text, big)
+        if meas:
+            return {"kind": "kpi", "label": request_text.strip()[:40],
+                    "column": meas, "agg": "max" if sup_max else "min"}
 
     if wants_chart:
         dim = cats[0] if cats else None
@@ -827,18 +884,61 @@ def _parse_widget(request_text, tables):
     return {"kind": "kpi", "label": request_text.strip()[:40], "column": col, "agg": agg}
 
 
+def _is_near_unique(series):
+    """A column where almost every value is distinct (player names, IDs) — grouping it and counting
+    occurrences is meaningless, so a count-chart over it is almost always a misinterpretation."""
+    n = len(series)
+    return n >= 8 and series.nunique(dropna=True) / n > 0.7
+
+
+def _pick_measure(request_text, df):
+    """Choose the numeric column to rank/aggregate by: prefer one whose name overlaps the request
+    (e.g. 'kg'/'weight'), else the first real measure in the table. Returns a column name or None."""
+    text = " " + request_text.lower() + " "
+    measures = [str(c) for c in df.columns if col_kind(df[c]) == "numeric" and is_measure(c, df[c])]
+    if not measures:
+        measures = [str(c) for c in df.columns if col_kind(df[c]) == "numeric"]
+    if not measures:
+        return None
+    best, best_n = None, 0
+    for name in measures:
+        toks = set(name.lower().replace("(", " ").replace(")", " ").split())
+        n = sum(1 for tk in toks if tk and tk in text)
+        if n > best_n:
+            best_n, best = n, name
+    return best or measures[0]
+
+
+def _repair_chart(spec, request_text, tables):
+    """If a chart would group a near-unique entity (names/IDs) and just COUNT rows, attach the real
+    numeric measure the user means so it ranks entities by value instead of by frequency."""
+    ddf, dcol = _find_col(tables, spec.get("dimension"))
+    if dcol is None:
+        return spec
+    _, mcol = _find_col(tables, spec.get("measure")) if spec.get("measure") else (None, None)
+    counting = (spec.get("agg") or "count").lower() == "count" or mcol is None
+    if counting and _is_near_unique(ddf[dcol]):
+        meas = _pick_measure(request_text, ddf)
+        if meas:
+            spec = dict(spec, measure=meas,
+                        agg="mean" if (spec.get("agg") == "mean") else "sum")
+    return spec
+
+
 def interpret_widget(request_text, tables, profile):
     """Turn a free-text request into ONE computed widget. Model first, deterministic parse as
     fallback. Returns {"kind":"kpi","kpi":{label,value,sub}} or {"kind":"chart","chart":{...}},
     or None if it can't be grounded in the real columns."""
-    spec = _ask_widget_model(request_text, profile) or _parse_widget(request_text, tables)
+    spec = _ask_widget_model(request_text, profile, tables) or _parse_widget(request_text, tables)
     if not isinstance(spec, dict):
         return None
 
     if spec.get("kind") == "chart":
+        spec = _repair_chart(spec, request_text, tables)
         c = compute_chart(tables, spec)
         if not c:                                      # model picked a bad column → try parser
             spec = _parse_widget(request_text, tables)
+            spec = _repair_chart(spec, request_text, tables) if spec else spec
             c = compute_chart(tables, spec) if spec and spec.get("kind") == "chart" else None
         if not c:
             return None
@@ -853,3 +953,87 @@ def interpret_widget(request_text, tables, profile):
     agg = (spec.get("agg") or "sum").lower()
     label = spec.get("label") or (f"{_AGG_SUB.get(agg, '').title()} {col}".strip() if col else "Metric")
     return {"kind": "kpi", "kpi": {"label": label, "value": val, "sub": _agg_sub(spec)}}
+
+
+# --------------------------------------------------------------------------- #
+#  9. EXPORT FOR POWER BI — cleaned/typed data (.xlsx) + ready-to-paste DAX
+# --------------------------------------------------------------------------- #
+def clean_for_export(df):
+    """A copy of the table with numeric columns coerced to real numbers, so Power BI types them
+    as numeric on import (instead of leaving '$48,000' / '32%' as text). Other columns are unchanged."""
+    out = df.copy()
+    for c in out.columns:
+        if col_kind(out[c]) == "numeric":
+            out[c] = numeric_view(out[c])
+    return out
+
+
+def _safe_sheet_name(label, used):
+    """Excel sheet name: ≤31 chars, none of []:*?/\\, unique. This name becomes the Power BI
+    query/table name, so the generated DAX references it verbatim."""
+    name = re.sub(r"[\[\]:*?/\\]", " ", str(label)).strip() or "Sheet"
+    name = name[:31]
+    base, i = name, 1
+    while name.lower() in used:
+        suf = f" {i}"
+        name = base[: 31 - len(suf)] + suf
+        i += 1
+    used.add(name.lower())
+    return name
+
+
+_DAX_AGG = [("Total", "SUM"), ("Average", "AVERAGE"), ("Max", "MAX"), ("Min", "MIN")]
+
+
+def build_dax_measures(named_tables):
+    """Generate a starter palette of DAX measures from the columns: SUM/AVERAGE/MAX/MIN for real
+    measures, DISTINCTCOUNT for categories & identifiers, a row count per table. Names are unique
+    across the model (Power BI requires it). `named_tables` is [(sheet_name, df), …]."""
+    out = [
+        "// Power BI / DAX measures — generated by Sheet → Dashboard",
+        "//",
+        "// 1) Power BI Desktop → Get Data → Excel workbook → pick the .xlsx in this zip,",
+        "//    tick every sheet, then Load.",
+        "// 2) For each line below: right-click the matching table in the Fields pane →",
+        "//    New measure → paste the line. Table names match the .xlsx sheet names.",
+        "",
+    ]
+    seen = set()
+
+    def uniq(name):
+        n, i = name, 2
+        while n.lower() in seen:
+            n = f"{name} {i}"
+            i += 1
+        seen.add(n.lower())
+        return n
+
+    for sheet, df in named_tables:
+        t = sheet.replace("'", "")
+        block = [f"{uniq(t + ' Row Count')} = COUNTROWS('{t}')"]
+        for c in df.columns:
+            col = str(c).replace("[", "").replace("]", "")
+            kind = col_kind(df[c])
+            if kind == "numeric" and is_measure(c, df[c]):
+                for word, fn in _DAX_AGG:
+                    block.append(f"{uniq(word + ' ' + col)} = {fn}('{t}'[{col}])")
+            elif kind in ("numeric", "categorical"):     # non-measure numeric or category
+                block.append(f"{uniq('Distinct ' + col)} = DISTINCTCOUNT('{t}'[{col}])")
+        if len(block) > 1:
+            out.append(f"// ===== Table: {t} =====")
+            out.extend(block)
+            out.append("")
+    return "\n".join(out)
+
+
+def build_powerbi_export(tables):
+    """Return (xlsx_bytes, dax_text). The .xlsx holds the cleaned/typed tables; the DAX references
+    those exact sheet names — generated together so the two always stay in sync."""
+    buf = io.BytesIO()
+    used, named = set(), []
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for label, df in tables:
+            sheet = _safe_sheet_name(label, used)
+            clean_for_export(df).to_excel(xw, sheet_name=sheet, index=False)
+            named.append((sheet, df))
+    return buf.getvalue(), build_dax_measures(named)

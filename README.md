@@ -46,10 +46,16 @@ sums.
   (multi-sheet), and `.csv`. Cleans formatted numbers like `$48,000`, `32%`, `(1,200)`.
 - **Lots of metrics** — 9 KPIs (Standard) or ~16 (Detailed), plus a full statistics section
   (numeric: mean / median / min / max / std / sum; categorical: distinct / most-common / count / share).
-- **Charts** that fit the data — bar / line / pie / doughnut, chosen by the model.
+- **Charts** that fit the data — bar / line / pie / doughnut, chosen by the model. Each bar/line chart
+  has **Top / Bottom** and **Linear / Log** toggles (client-side, so they keep working offline).
 - **Add your own, in plain English** — an "Add your own" box at the bottom of every report turns a
-  request like *"average revenue by region as a pie"* into a real KPI or chart, computed from your
-  data and added live. The input box itself is stripped from the downloaded file — only the widgets stay.
+  request like *"average revenue by region as a pie"* or *"heaviest player"* into a real KPI or chart,
+  computed from your data and added live. It leads with your strongest local model (e.g. `qwen2.5:14b`)
+  and only accepts an answer that references a real column. The input box itself is stripped from the
+  downloaded file — only the widgets stay.
+- **Export for Power BI** — one button downloads a zip with the cleaned, type-coerced `.xlsx` (numbers
+  import as numbers, one tab per table) plus a `measures_dax.txt` of ready-to-paste DAX measures whose
+  table names match the sheets. Data + measures, not the chart layout.
 - **Customisable** — set a focus prompt ("revenue by region"), detail level, chart density, and a theme.
 - **Spreadsheet-native design** — a cell-grid backdrop, a `fx =DASHBOARD(...)` formula-bar hero,
   column-letter section markers, and monospace tabular numerals. Four themes: **Grid** (default),

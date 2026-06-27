@@ -1,14 +1,16 @@
 """server.py — localhost web app: drop a sheet, answer a few questions, get a tailored dashboard."""
+import io
 import os
 import json
 import time
+import zipfile
 import secrets
 import traceback
 
 from flask import Flask, request, send_file, abort
 
 from analyzer import (analyze, load_tables, build_profile, build_questions,
-                      answers_to_prefs, interpret_widget)
+                      answers_to_prefs, interpret_widget, build_powerbi_export)
 from render import render_dashboard
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -398,6 +400,49 @@ def add_widget():
         fh.write(html)
     print(f"[add_widget] {name} += {widget['kind']} :: {req_text!r}")
     return payload, 200
+
+
+POWERBI_README = (
+    "Sheet → Dashboard — Power BI export\n"
+    "================================\n\n"
+    "This zip contains:\n"
+    "  • <name>_data.xlsx  — your sheet, cleaned and type-coerced (numbers are real numbers,\n"
+    "                          not '$48,000' text), one tab per source table.\n"
+    "  • measures_dax.txt  — a starter set of DAX measures (totals, averages, distinct counts)\n"
+    "                          that match the columns in the .xlsx.\n\n"
+    "Steps in Power BI Desktop:\n"
+    "  1. Get Data → Excel workbook → select <name>_data.xlsx → tick every sheet → Load.\n"
+    "  2. Open measures_dax.txt. For each line, right-click the matching table in the Fields\n"
+    "     pane → New measure → paste the line. (Table names match the sheet names.)\n"
+    "  3. Build visuals from the columns and your new measures.\n\n"
+    "Note: this exports the DATA and the MEASURES. The chart layout from the HTML dashboard is\n"
+    "not transferred — Power BI builds its own visuals from these inputs.\n"
+)
+
+
+@app.route("/export/<name>")
+def export_powerbi(name):
+    """Download a Power BI starter kit for this dashboard: cleaned .xlsx + DAX measures, zipped."""
+    name = os.path.basename(name)
+    entry = DASHBOARDS.get(name)
+    if not entry:
+        abort(410, "This dashboard's session has expired — regenerate it to export.")
+    try:
+        tables = load_tables(entry["raw"], entry["filename"])
+        xlsx, dax = build_powerbi_export(tables)
+    except Exception as e:
+        traceback.print_exc()
+        abort(400, f"Could not build the Power BI export: {e}")
+    base = os.path.splitext(os.path.basename(entry["filename"] or "dashboard"))[0] or "dashboard"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{base}_data.xlsx", xlsx)
+        z.writestr("measures_dax.txt", dax)
+        z.writestr("README.txt", POWERBI_README)
+    buf.seek(0)
+    print(f"[export] {name} -> {base}_powerbi.zip ({len(tables)} tables)")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{base}_powerbi.zip")
 
 
 if __name__ == "__main__":

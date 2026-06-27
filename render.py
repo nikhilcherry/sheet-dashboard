@@ -69,12 +69,7 @@ def render_dashboard(data: dict) -> str:
             </div>"""
         for i, k in enumerate(data["kpis"]))
 
-    charts = "".join(
-        f"""<figure class="chart">
-              <figcaption>{_esc(c['title'])}</figcaption>
-              <div class="cwrap"><canvas id="chart{i}"></canvas></div>
-            </figure>"""
-        for i, c in enumerate(data["charts"]))
+    charts = _charts_html(data["charts"])
 
     insights = "".join(f"<li>{_esc(x)}</li>" for x in data["insights"]) \
         or "<li>No further observations.</li>"
@@ -129,6 +124,27 @@ def render_dashboard(data: dict) -> str:
 def _eyebrow(letter, label):
     return (f'<div class="eb"><span class="col">{letter}</span>'
             f'<span class="eb-l">{label}</span></div>')
+
+
+def _charts_html(charts):
+    """Each chart figure, with a Top/Bottom + Linear/Log control bar for bar & line charts.
+    The controls run entirely client-side on data embedded in the page (works offline too)."""
+    out = []
+    for i, c in enumerate(charts):
+        ctl = ""
+        if c.get("type") in ("bar", "line"):
+            rank = (f'<div class="seg" data-ctl="rank" data-i="{i}">'
+                    f'<button data-v="top">Top</button>'
+                    f'<button data-v="bottom">Bottom</button></div>') if c.get("rankable") else ""
+            scale = (f'<div class="seg" data-ctl="scale" data-i="{i}">'
+                     f'<button data-v="linear">Linear</button>'
+                     f'<button data-v="log">Log</button></div>')
+            ctl = f'<div class="cc">{rank}{scale}</div>'
+        out.append(
+            f'<figure class="chart">'
+            f'<div class="chead"><figcaption>{_esc(c["title"])}</figcaption>{ctl}</div>'
+            f'<div class="cwrap"><canvas id="chart{i}"></canvas></div></figure>')
+    return "".join(out)
 
 
 def _stats_html(stats):
@@ -186,6 +202,7 @@ body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
 
 /* ── hero ─────────────────────────────────────────────── */
 .top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}
+.actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
 .tag{font-family:'IBM Plex Mono',monospace;font-size:.72rem;letter-spacing:.04em;
      color:var(--muted);display:flex;gap:7px;align-items:center}
 .tag b{color:var(--accent);font-weight:600}
@@ -243,8 +260,18 @@ h1{font-family:'Bricolage Grotesque','IBM Plex Sans',sans-serif;font-weight:700;
 /* ── charts ───────────────────────────────────────────── */
 .grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
 .chart{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+.chead{display:flex;justify-content:space-between;align-items:center;gap:12px;
+     margin-bottom:16px;flex-wrap:wrap}
 .chart figcaption{font-family:'Bricolage Grotesque',sans-serif;font-weight:600;font-size:1.04rem;
-     margin-bottom:16px;letter-spacing:-.01em}
+     letter-spacing:-.01em}
+.cc{display:flex;gap:8px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{font-family:'IBM Plex Mono',monospace;font-size:.68rem;padding:5px 10px;border:none;
+     border-left:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer;
+     transition:background .12s,color .12s}
+.seg button:first-child{border-left:none}
+.seg button:hover{color:var(--ink)}
+.seg button.on{background:var(--accent);color:var(--accent-ink)}
 .cwrap{position:relative;height:298px}
 
 /* ── statistics (ledger) ──────────────────────────────── */
@@ -310,10 +337,18 @@ footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--line);
 <div class="wrap">
   <div class="top">
     <div class="tag">SHEET <b>__SOURCE__</b> · __CELL__ cells</div>
-    <button class="dl" id="dlBtn">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/>
-           <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>Download</button>
+    <div class="actions">
+      <button class="dl no-export" id="pbiBtn"
+              title="Download a Power BI starter kit — cleaned .xlsx + ready-to-paste DAX measures">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/>
+             <rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+             <rect x="14" y="14" width="7" height="7"/></svg>Power BI</button>
+      <button class="dl" id="dlBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/>
+             <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>Download</button>
+    </div>
   </div>
   <h1>__TITLE__</h1>
   <p class="sub">__SUBTITLE__</p>
@@ -353,17 +388,29 @@ Chart.defaults.color=TICK;
 Chart.defaults.font.family="'IBM Plex Mono',monospace";
 Chart.defaults.font.size=11;
 
+const chartObjs={}, chartState={};
+function viewData(c,i){                         // pick Top/Bottom slice per current toggle state
+  const s=chartState[i];
+  if((c.type==="bar"||c.type==="line")&&s){
+    if(s.rank==="bottom"&&c.bottom) return c.bottom;
+    if(s.rank==="top"&&c.top) return c.top;
+  }
+  return {labels:c.labels,values:c.values};
+}
 function buildChart(el,c,i){
+  if(!chartState[i]) chartState[i]={rank:(c.agg==="min"?"bottom":"top"),scale:"linear"};
+  const log=chartState[i].scale==="log";
+  const d=viewData(c,i);
   const circ=c.type==="pie"||c.type==="doughnut";
-  const cols=c.labels.map((_,j)=>PALETTE[j%PALETTE.length]);
-  return new Chart(el,{type:c.type,data:{labels:c.labels,datasets:[{label:c.title,data:c.values,
+  const cols=d.labels.map((_,j)=>PALETTE[j%PALETTE.length]);
+  const chart=new Chart(el,{type:c.type,data:{labels:d.labels,datasets:[{label:c.title,data:d.values,
       backgroundColor:circ?cols:(c.type==="line"?PALETTE[i%PALETTE.length]+"22":cols),
       borderColor:circ?SEG:(c.type==="line"?PALETTE[i%PALETTE.length]:cols),
       borderWidth:circ?2:(c.type==="line"?2.5:0),borderRadius:c.type==="bar"?3:0,
-      fill:c.type==="line",tension:.34,pointRadius:c.type==="line"?0:0,
+      fill:c.type==="line",tension:.34,pointRadius:0,
       pointHoverRadius:4,pointBackgroundColor:PALETTE[i%PALETTE.length]}]},
     options:{responsive:true,maintainAspectRatio:false,
-      animation:{duration:800,easing:"easeOutCubic"},
+      animation:{duration:600,easing:"easeOutCubic"},
       plugins:{legend:{display:circ,position:"bottom",
           labels:{boxWidth:9,boxHeight:9,padding:13,usePointStyle:true,
             font:{family:"'IBM Plex Sans',sans-serif",size:11}}},
@@ -372,9 +419,28 @@ function buildChart(el,c,i){
       scales:circ?{}:{x:{grid:{display:false},border:{color:GRID},
           ticks:{maxRotation:40,autoSkip:true,
             callback(v){const s=this.getLabelForValue(v);return s.length>13?s.slice(0,12)+"…":s;}}},
-        y:{grid:{color:GRID},border:{display:false},beginAtZero:true}}}});
+        y:{type:log?"logarithmic":"linear",grid:{color:GRID},border:{display:false},
+           beginAtZero:!log}}}});
+  chartObjs[i]=chart;return chart;
+}
+function rerenderChart(i){
+  const el=document.getElementById("chart"+i); if(!el) return;
+  if(chartObjs[i]) chartObjs[i].destroy();
+  buildChart(el,CHARTS[i],i);
 }
 CHARTS.forEach((c,i)=>{const el=document.getElementById("chart"+i);if(el)buildChart(el,c,i);});
+// per-chart Top/Bottom + Linear/Log toggles (pure client-side, work in a downloaded copy too)
+document.querySelectorAll(".seg").forEach(seg=>{
+  const i=+seg.dataset.i, ctl=seg.dataset.ctl;
+  seg.querySelectorAll("button").forEach(b=>{
+    if(chartState[i]&&chartState[i][ctl]===b.dataset.v) b.classList.add("on");
+    b.addEventListener("click",()=>{
+      if(!chartState[i]) return;
+      seg.querySelectorAll("button").forEach(x=>x.classList.remove("on"));
+      b.classList.add("on");chartState[i][ctl]=b.dataset.v;rerenderChart(i);
+    });
+  });
+});
 
 document.querySelectorAll(".kpi-val").forEach(el=>{
   const raw=el.dataset.val, num=parseFloat(raw.replace(/[^0-9.\-]/g,""));
@@ -401,6 +467,14 @@ dl&&dl.addEventListener("click",async()=>{
   a.download=(document.title||"dashboard").replace(/[^\w]+/g,"_")+".html";
   document.body.appendChild(a);a.click();a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+});
+
+// Power BI export — server builds a zip (cleaned .xlsx + DAX); needs the live server,
+// so this button is .no-export and absent from a downloaded copy.
+const pbi=document.getElementById("pbiBtn");
+pbi&&pbi.addEventListener("click",()=>{
+  const id=location.pathname.split("/").filter(Boolean).pop();
+  window.location.href="/export/"+id;
 });
 
 const q=document.getElementById("q");
